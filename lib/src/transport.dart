@@ -910,7 +910,13 @@ class Transport extends EnhancedEventEmitter {
 
         producerCallback?.call(producer);
       } catch (error) {
-        _handler.stopSending(sendResult.localId);
+        _logger.error('produce() failed after negotiating [localId:${sendResult.localId}]: $error');
+        // Must be awaited: stopSending() renegotiates (createOffer/setLocal/
+        // setRemoteDescription) on the same _pc. Firing it without waiting
+        // let FlexQueue start the next produce()'s negotiation concurrently
+        // on the same peer connection, which is what produced the
+        // "m-lines order doesn't match previous offer/answer" crash.
+        await _handler.stopSending(sendResult.localId);
 
         throw error;
       }

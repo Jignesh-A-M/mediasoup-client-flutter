@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:sdp_transform/sdp_transform.dart';
@@ -31,6 +33,10 @@ class UnifiedPlan extends HandlerInterface {
   DtlsRole? _forcedLocalDtlsRole;
   // RTCPeerConnection instance.
   RTCPeerConnection? _pc;
+  // run() is void (fire-and-forget, called from Transport's constructor) but
+  // createPeerConnection() is a genuinely async platform-channel call, so
+  // send()/receive() can be invoked before _pc is assigned. Gate on this.
+  final Completer<void> _pcReady = Completer<void>();
   // Map of RTCTransceivers indexed by MID.
   Map<String, RTCRtpTransceiver> _mapMidTransceiver = {};
   // Whether a DataChannel m=application section has been created.
@@ -87,10 +93,18 @@ class UnifiedPlan extends HandlerInterface {
   Future<void> close() async {
     _logger.debug('close()');
 
-    // Close RTCPeerConnection.
+    // Close RTCPeerConnection. `close()` alone only transitions WebRTC-level
+    // state — `dispose()` is what actually invokes the native
+    // `peerConnectionDispose` teardown and releases the platform media
+    // session (same gap already found and fixed once in
+    // `LobbyPreviewCubit`'s throwaway meter connection — this is the same
+    // bug in the real call's send/recv transport `_pc`, which is why camera/
+    // mic stayed active after a call ended even though local tracks were
+    // separately stopped).
     if (_pc != null) {
       try {
         await _pc!.close();
+        await _pc!.dispose();
       } catch (error) {}
     }
   }
@@ -124,11 +138,18 @@ class UnifiedPlan extends HandlerInterface {
 
       return nativeRtpCapabilities;
     } catch (error) {
+      throw error;
+    } finally {
+      // This pc only exists to probe native capabilities via createOffer();
+      // it's never used for real negotiation, so it must be disposed here
+      // regardless of outcome — leaving it open leaks a native peer
+      // connection right before the real send/recv transports are created.
+      // `close()` alone doesn't release the native object — same gap fixed
+      // in this file's `close()` method above, `dispose()` is required too.
       try {
         await pc.close();
+        await pc.dispose();
       } catch (error2) {}
-
-      throw error;
     }
   }
 
@@ -179,6 +200,8 @@ class UnifiedPlan extends HandlerInterface {
 
   @override
   Future<HandlerReceiveResult> receive(HandlerReceiveOptions options) async {
+    await _pcReady.future;
+
     _assertRecvDirection();
 
     _logger.debug(
@@ -191,7 +214,7 @@ class UnifiedPlan extends HandlerInterface {
       mid: localId,
       kind: options.kind,
       offerRtpParameters: options.rtpParameters,
-      streamId: options.rtpParameters.rtcp!.cname,
+      streamId: options.rtpParameters.rtcp!.cname ?? '',
       trackId: options.trackId,
     );
 
@@ -443,18 +466,23 @@ class UnifiedPlan extends HandlerInterface {
       {'DtlsSrtpKeyAgreement': true}
     ];
 
-    _pc = await createPeerConnection(
-      {
-        'iceServers':
-            options.iceServers.map((RTCIceServer i) => i.toMap()).toList(),
-        'iceTransportPolicy': options.iceTransportPolicy?.value ?? 'all',
-        'bundlePolicy': 'max-bundle',
-        'rtcpMuxPolicy': 'require',
-        'sdpSemantics': 'unified-plan',
-        ...options.additionalSettings,
-      },
-      _constrains,
-    );
+    try {
+      _pc = await createPeerConnection(
+        {
+          'iceServers':
+              options.iceServers.map((RTCIceServer i) => i.toMap()).toList(),
+          'iceTransportPolicy': options.iceTransportPolicy?.value ?? 'all',
+          'bundlePolicy': 'max-bundle',
+          'rtcpMuxPolicy': 'require',
+          'sdpSemantics': 'unified-plan',
+          ...options.additionalSettings,
+        },
+        _constrains,
+      );
+    } catch (error) {
+      _pcReady.completeError(error);
+      return;
+    }
 
     // Handle RTCPeerConnection connection status.
     _pc!.onIceConnectionState = (RTCIceConnectionState state) {
@@ -490,10 +518,14 @@ class UnifiedPlan extends HandlerInterface {
           break;
       }
     };
+
+    _pcReady.complete();
   }
 
   @override
   Future<HandlerSendResult> send(HandlerSendOptions options) async {
+    await _pcReady.future;
+
     _assertSendRirection();
 
     _logger.debug(
@@ -524,15 +556,32 @@ class UnifiedPlan extends HandlerInterface {
 
     MediaSectionIdx mediaSectionIdx = _remoteSdp.getNextMediaSectionIdx();
 
-    RTCRtpTransceiver transceiver = await _pc!.addTransceiver(
-      track: options.track,
-      kind: RTCRtpMediaTypeExtension.fromString(options.track.kind!),
-      init: RTCRtpTransceiverInit(
-        direction: TransceiverDirection.SendOnly,
-        streams: [options.stream],
-        sendEncodings: options.encodings,
-      ),
-    );
+    late RTCRtpTransceiver transceiver;
+    try {
+      transceiver = await _pc!.addTransceiver(
+        track: options.track,
+        kind: RTCRtpMediaTypeExtension.fromString(options.track.kind!),
+        init: RTCRtpTransceiverInit(
+          direction: TransceiverDirection.SendOnly,
+          streams: [options.stream],
+          sendEncodings: options.encodings,
+        ),
+      );
+    } catch (_) {
+      // flutter_webrtc's Android addTransceiver() can succeed natively but
+      // crash deserializing its own return value (missing 'direction' in the
+      // platform response) when adding a second transceiver to the same
+      // PeerConnection before the first negotiation round-trip completes.
+      // The transceiver still exists natively — recover it instead of
+      // trusting the broken return value.
+      final recoveredTransceivers = await _pc!.getTransceivers();
+      transceiver = recoveredTransceivers.lastWhere(
+        (t) =>
+            t.sender.track?.id == options.track.id &&
+            t.sender.track?.kind == options.track.kind,
+        orElse: () => throw 'No transceiver found after addTransceiver failure',
+      );
+    }
 
     RTCSessionDescription offer = await _pc!.createOffer({});
     SdpObject localSdpObject = SdpObject.fromMap(parse(offer.sdp!));

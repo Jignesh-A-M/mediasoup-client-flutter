@@ -1,5 +1,4 @@
 import 'package:flutter_webrtc/flutter_webrtc.dart';
-import 'package:mediasoup_client_flutter/src/common/index.dart';
 
 /// The RTP capabilities define what mediasoup or an endpoint can receive at
 /// media level.
@@ -50,7 +49,9 @@ class RtpCapabilities {
 
   Map<String, dynamic> toMap() {
     return <String, dynamic>{
-      'codecs': codecs.map((RtpCodecCapability codec) => codec.toMap()).toList()
+      'codecs': codecs.map((RtpCodecCapability codec) => codec.toMap()).toList(),
+      'headerExtensions': headerExtensions.map((RtpHeaderExtension ext) => ext.toMap()).toList(),
+      'fecMechanisms': fecMechanisms,
     };
   }
 }
@@ -314,6 +315,16 @@ class RtpHeaderExtension {
         preferredId = data['preferredId'],
         preferredEncrypt = data['preferredEncrypt'],
         direction = RtpHeaderDirectionExtension.fromString(data['direction']);
+
+  Map<String, dynamic> toMap() {
+    return <String, dynamic>{
+      if (kind != null) 'kind': RTCRtpMediaTypeExtension.value(kind!),
+      'uri': uri,
+      'preferredId': preferredId,
+      if (preferredEncrypt != null) 'preferredEncrypt': preferredEncrypt,
+      if (direction != null) 'direction': direction!.value,
+    };
+  }
 }
 
 class RtxSsrc {
@@ -403,8 +414,13 @@ class RtpEncodingParameters extends RTCRtpEncoding {
    * Others.
    */
   bool? adaptivePtime;
-  Priority? priority;
-  Priority? networkPriority;
+  // RTCPriorityType (from flutter_webrtc), not this package's own Priority
+  // enum — RtpEncodingParameters extends RTCRtpEncoding, whose `priority`/
+  // `networkPriority` fields are typed RTCPriorityType as of flutter_webrtc
+  // 1.x (were compatible with this package's own Priority enum in the 0.9.x
+  // this fork was ported from — see LESSONS.md).
+  RTCPriorityType priority;
+  RTCPriorityType? networkPriority;
 
   RtpEncodingParameters({
     this.codecPayloadType,
@@ -412,7 +428,7 @@ class RtpEncodingParameters extends RTCRtpEncoding {
     this.dtx,
     this.scalabilityMode,
     this.adaptivePtime,
-    this.priority,
+    this.priority = RTCPriorityType.low,
     this.networkPriority,
     bool active = true,
     int? maxBitrate,
@@ -440,12 +456,8 @@ class RtpEncodingParameters extends RTCRtpEncoding {
       dtx: data['dtx'],
       scalabilityMode: data['scalabilityMode'],
       adaptivePtime: data['adaptivePtime'],
-      priority: data['priority'] != null
-          ? PriorityExtension.fromString(data['priority'])
-          : null,
-      networkPriority: data['networkPriority'] != null
-          ? PriorityExtension.fromString(data['networkPriority'])
-          : null,
+      priority: rtcPriorityTypeForString(data['priority'] as String?) ?? RTCPriorityType.low,
+      networkPriority: rtcPriorityTypeForString(data['networkPriority'] as String?),
       active: data['active'] ?? true,
       maxBitrate: data['maxBitrate'],
       maxFramerate: data['maxFramerate'],
@@ -473,8 +485,12 @@ class RtpEncodingParameters extends RTCRtpEncoding {
       if (dtx != null) 'dtx': dtx,
       if (scalabilityMode != null) 'scalabilityMode': scalabilityMode,
       if (adaptivePtime != null) 'adaptivePtime': adaptivePtime,
-      if (priority != null) 'priority': priority,
-      if (networkPriority != null) 'networkPriority': networkPriority,
+      // priority/networkPriority are RTCPriorityType (an enum), not directly
+      // JSON-encodable — must go through webrtc_interface's own string map,
+      // same one fromMap() already uses in reverse via rtcPriorityTypeForString.
+      'priority': typeRTCPriorityTypeString[priority],
+      if (networkPriority != null)
+        'networkPriority': typeRTCPriorityTypeString[networkPriority],
     };
   }
 
@@ -486,7 +502,7 @@ class RtpEncodingParameters extends RTCRtpEncoding {
       dtx: next.dtx ?? prev.dtx,
       scalabilityMode: next.scalabilityMode ?? prev.scalabilityMode,
       adaptivePtime: next.adaptivePtime ?? prev.adaptivePtime,
-      priority: next.priority ?? prev.priority,
+      priority: next.priority,
       networkPriority: next.networkPriority ?? prev.networkPriority,
       active: next.active,
       maxBitrate: next.maxBitrate ?? prev.maxBitrate,
@@ -806,7 +822,9 @@ class RtcpParameters extends RTCRTCPParameters {
   }) {
     return RtcpParameters(
       mux: mux != null ? mux : old.mux,
-      cname: cname != null ? cname : old.cname,
+      // Base class's `cname` (RTCRTCPParameters) is nullable; this
+      // subclass's constructor param isn't (defaults to '') — coalesce.
+      cname: cname ?? old.cname ?? '',
       reducedSize: reducedSize != null ? reducedSize : old.reducedSize,
     );
   }
